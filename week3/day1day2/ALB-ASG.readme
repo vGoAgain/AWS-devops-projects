@@ -4,6 +4,8 @@ Quick reference describing how this app is deployed behind an Application Load B
 
 ---
 
+Application code repo : https://github.com/vGoAgain/vp-portfolio-app
+
 ## Architecture (high level) 💡
 
 - Route53 -> Application Load Balancer (ALB)
