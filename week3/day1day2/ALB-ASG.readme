@@ -307,4 +307,3 @@ If you want any of the optional items applied (HTTPS, IaC, health-check tuning),
 
 ---
 
-If you'd like, tell me the values for the questions above and I will update this README and/or generate IaC (Terraform / CloudFormation) for you.
