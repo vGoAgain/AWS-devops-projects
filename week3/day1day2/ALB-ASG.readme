@@ -1,0 +1,310 @@
+# ALB + ASG deployment — vp-portfolio-app ✅
+
+Quick reference describing how this app is deployed behind an Application Load Balancer (ALB) and Auto Scaling Group (ASG). Includes the EC2 user-data used in the Launch Template and verification / troubleshooting steps.
+
+---
+
+## Architecture (high level) 💡
+
+- Route53 -> Application Load Balancer (ALB)
+- ALB -> Target Group (HTTP) -> Auto Scaling Group (Launch Template)
+- Launch Template user-data provisions the app on each EC2 instance (clones repo and runs `start.sh`)
+
+
+## What this README contains
+
+1. Purpose and verification steps
+2. Full `ec2-user-data.sh` (exact contents used in the Launch Template)
+3. Health check & security-group checklist
+4. Troubleshooting + useful AWS CLI checks
+5. Questions I need answered from you
+
+---
+
+## Purpose / summary
+
+This environment runs `vp-portfolio-app` on EC2 instances created by an Auto Scaling Group (ASG). An ALB forwards client traffic to a Target Group that contains the ASG instances. Route53 points the public domain to the ALB DNS name.
+
+Use this document to verify the deployment, debug common issues, and to capture configuration details for automation.
+
+---
+
+## EC2 user-data (copied from `ec2-user-data.sh`) 🔧
+
+```bash
+#!/bin/bash
+
+# EC2 user-data install script (cloud-init compatible)
+# - Logs each step to /var/log/install.log
+# - Runs: yum update, install git, clone repo, run ./start.sh (nohup)
+# Usage: paste the whole file into EC2 "User data" field (or run locally as root).
+
+LOG=/var/log/install.log
+REPO_URL="https://github.com/vGoAgain/vp-portfolio-app.git"
+TARGET_DIR="/home/ec2-user/vp-portfolio-app"
+BRANCH="main"
+APP_USER="ec2-user"
+START_ARGS=""   # change to "gunicorn" if you want gunicorn
+
+set -euo pipefail
+exec > >(tee -a "$LOG") 2>&1
+
+log() {
+  echo "$(date -u +"%Y-%m-%d %H:%M:%S UTC") - $*"
+}
+
+log "==== EC2 user-data: begin installation ===="
+
+log "Updating system packages (yum update -y)..."
+if yum update -y; then
+  log "yum update completed"
+else
+  log "yum update failed"
+fi
+
+log "Installing git (yum install -y git)..."
+if yum install -y git; then
+  log "git installed"
+else
+  log "git install failed"
+fi
+
+log "Ensuring target directory exists: $TARGET_DIR"
+mkdir -p "$TARGET_DIR"
+chown -R "$APP_USER":"$APP_USER" "$TARGET_DIR"
+
+# Clone or pull the repository
+if [ -d "$TARGET_DIR/.git" ]; then
+  log "Repository already exists in $TARGET_DIR — pulling latest $BRANCH"
+  sudo -u "$APP_USER" git -C "$TARGET_DIR" fetch --all --prune
+  sudo -u "$APP_USER" git -C "$TARGET_DIR" checkout "$BRANCH" -f
+  sudo -u "$APP_USER" git -C "$TARGET_DIR" pull origin "$BRANCH"
+else
+  log "Cloning repository $REPO_URL into $TARGET_DIR (branch: $BRANCH)"
+  sudo -u "$APP_USER" git clone --branch "$BRANCH" "$REPO_URL" "$TARGET_DIR"
+fi
+
+cd "$TARGET_DIR"
+
+# Make sure start.sh is executable
+if [ -f "start.sh" ]; then
+  chmod +x start.sh
+  log "Found start.sh — made executable"
+else
+  log "ERROR: start.sh not found in repo!"
+  exit 1
+fi
+
+# Run start.sh as app user in background using nohup
+log "Starting application (running start.sh as $APP_USER) with nohup..."
+nohup sudo -u "$APP_USER" bash -lc "cd '$TARGET_DIR' && ./start.sh $START_ARGS" > "$LOG" 2>&1 &
+APP_PID=$!
+sleep 2
+if kill -0 "$APP_PID" 2>/dev/null; then
+  log "Application started (pid: $APP_PID)"
+else
+  log "Application process did not stay alive — check $LOG for errors"
+fi
+
+log "==== EC2 user-data: installation complete ===="
+
+# End of user-data
+```
+
+> Note: user-data writes a runtime log at `/var/log/install.log`. Cloud-init also sends output to `/var/log/cloud-init-output.log`.
+
+---
+
+## Recommended Target Group / ALB settings (confirm your actual values) ⚙️
+
+- Target Group protocol: `HTTP`
+- Target Group port: `80` (change if your app listens elsewhere)
+- Target type: `instance`
+- Health check path: `/` (or `/health` if you add one)
+- Health check protocol: `HTTP`
+- Health check port: `traffic-port`
+- Unhealthy threshold / healthy threshold: AWS defaults are fine (2/5) — adjust for your app start time
+- Idle timeout (ALB): default 60s
+
+Security-group rules (common pattern):
+- ALB SG: inbound 80/443 from Internet (0.0.0.0/0 or restricted CIDR)
+- Instance SG: inbound 80 from ALB security group only
+
+---
+
+## Verification steps ✅
+
+1. ALB -> health
+   - AWS Console: EC2 > Load Balancers > Target Groups > check "Targets" (should show healthy instances)
+   - CLI: `aws elbv2 describe-target-health --target-group-arn <tg-arn>`
+
+2. DNS -> Route53
+   - Confirm Route53 record is an Alias (or A) pointing to the ALB DNS name
+   - `dig +short your.domain.com` should return the ALB DNS
+
+3. App response
+   - `curl -I http://<ALB-DNS-or-your-domain>/` — should return HTTP 200 (or valid app response)
+
+4. EC2 / user-data logs
+   - SSH into instance and inspect `/var/log/install.log` and `/var/log/cloud-init-output.log`
+   - Confirm `start.sh` ran and the process is running (ps / system processes)
+
+5. ASG
+   - AWS Console: Auto Scaling Groups > verify desired/min/max and that instances belong to the correct Target Group
+   - CLI: `aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <asg-name>`
+
+---
+
+## Troubleshooting (common causes) ⚠️
+
+- Health check failing:
+  - App not started (check `/var/log/install.log`) or `start.sh` exiting
+  - Wrong health-check path or wrong listening port
+  - Instance SG blocking ALB
+- User-data errors:
+  - Check `/var/log/cloud-init-output.log`
+  - Git clone failed (private repo or network restriction)
+- DNS not resolving:
+  - Route53 record misconfigured (not Alias to ALB)
+  - DNS TTL / propagation delay
+
+Useful CLI commands:
+- Describe load balancer: `aws elbv2 describe-load-balancers --names <alb-name>`
+- Describe target groups: `aws elbv2 describe-target-groups --names <tg-name>`
+- Target health: `aws elbv2 describe-target-health --target-group-arn <tg-arn>`
+- ASG details: `aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <asg-name>`
+
+---
+
+## Security & production considerations 🔐
+
+- Use HTTPS on ALB (listener 443) and terminate TLS at ALB using ACM certificate
+- Ensure the instance IAM role only has the minimum permissions needed
+- Configure proper health-check path (e.g. `/health`) that verifies app readiness
+- Add CloudWatch alarms + ASG scaling policies (target tracking is easiest)
+- Enable ALB access logs for traffic analysis
+
+---
+
+## Deployed configuration (confirmed) ✅
+
+- Domain: `vaishakhprasad.com` (Route53 → ALB)
+- ALB: `ALB-portfolio-app`
+- Target Group: `TG-portfolio-app` (port: `8000` — confirmed)
+- Auto Scaling Group: `asg-portfolio-app` (min=1 desired=2 max=3)
+
+> Note: the application (per `app.py` and `gunicorn_config.py`) binds to `0.0.0.0:8000`. Your Target Group should use port `8000` (instance port). If you prefer to terminate on port 80 at the instance, add an nginx or systemd proxy that forwards 80 → 8000.
+
+### ALB listener configuration (recommended) 🔁
+
+- HTTP listener (port 80): ALB receives traffic on port 80 and forwards to `TG-portfolio-app` (target port 8000).
+
+  Example AWS CLI to create HTTP listener:
+
+  ```bash
+  aws elbv2 create-listener \
+    --load-balancer-arn <alb-arn> \
+    --protocol HTTP \
+    --port 80 \
+    --default-actions Type=forward,TargetGroupArn=<tg-arn>
+  ```
+
+- HTTPS listener (port 443) — optional, requires ACM certificate. Example:
+
+  ```bash
+  aws elbv2 create-listener \
+    --load-balancer-arn <alb-arn> \
+    --protocol HTTPS \
+    --port 443 \
+    --certificates CertificateArn=<acm-cert-arn> \
+    --default-actions Type=forward,TargetGroupArn=<tg-arn>
+  ```
+
+- Health check: `HTTP /` (or `/health` if you add a readiness endpoint), port `traffic-port`.
+
+- Security groups:
+  - ALB SG: inbound 80 (and 443 if HTTPS) from the internet; outbound to instances.
+  - Instance SG: inbound 8000 from ALB SG only; outbound as needed.
+
+---
+
+## Launch Template & instance details (confirmed) 🏷️
+
+- Launch Template name: `portfolio-app-launch-template`
+- AMI: `Amazon Linux` (please confirm exact AMI ID if you want IaC)
+- Instance type: `t2.nano` (confirmed)
+- Security Group: `SG-AppAccessEC2`
+  - Inbound rules (as you described):
+    - SSH from your IP only
+    - Port `8000` allowed — **source: ALB security group only (confirmed)**
+  - Recommendation: keep port `8000` restricted to the ALB SG (secure and correct)
+
+CLI checks for these resources:
+- Describe Launch Template by name:
+  `aws ec2 describe-launch-templates --launch-template-names portfolio-app-launch-template`
+- Describe security group by name:
+  `aws ec2 describe-security-groups --filters Name=group-name,Values=SG-AppAccessEC2`
+
+---
+
+## Status — Finalized ✅
+
+This README documents the live deployment as of 2026-02-13 and reflects the configuration you confirmed.
+
+**Deployment snapshot (confirmed)**
+- Domain: `vaishakhprasad.com`
+- ALB: `ALB-portfolio-app`
+- Target Group: `TG-portfolio-app` (instance port `8000`)
+- Auto Scaling Group: `asg-portfolio-app` (min=1 desired=2 max=3)
+- Launch Template: `portfolio-app-launch-template` (AMI: Amazon Linux, instance type: `t2.nano`)
+- Security Group: `SG-AppAccessEC2` — SSH from your IP; port `8000` **restricted to ALB SG**
+- EC2 user-data: uses the repository `https://github.com/vGoAgain/vp-portfolio-app.git` and runs `./start.sh` (see `/var/log/install.log`)
+
+**Notes**
+- App binds to `0.0.0.0:8000` (Gunicorn or Flask dev server via `start.sh`).
+- Health-check path: `/` (change to `/health` if you add a readiness endpoint).
+
+**Optional items (no action required to keep deployment running)**
+- TLS termination at ALB — provide ACM certificate ARN if you want HTTPS configured.
+- Launch Template version / exact AMI ID — provide only if you want IaC exported precisely.
+- Generate Terraform / CloudFormation — say `generate terraform` and I will produce IaC.
+
+---
+
+## How to verify quickly 🔎
+
+- ALB: `aws elbv2 describe-load-balancers --names ALB-portfolio-app`
+- Target Group (shows port & health): `aws elbv2 describe-target-groups --names TG-portfolio-app`
+- Target health: `aws elbv2 describe-target-health --target-group-arn <tg-arn>`
+- ASG: `aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names asg-portfolio-app`
+- DNS check: `dig +short vaishakhprasad.com`
+- SSH / user-data logs on instance: `/var/log/install.log`, `/var/log/cloud-init-output.log`
+
+---
+
+If you want any of the optional items applied (HTTPS, IaC, health-check tuning), tell me which one and I'll produce the next artifacts.
+
+---
+
+
+
+---
+
+## Next steps I can do for you 🔭
+
+- Add/confirm health-check path and tune ASG scaling policies
+- Create Terraform/CFN to codify ALB + ASG + Route53
+- Add HTTPS listener + ACM certificate and update Route53
+- Troubleshoot any failing health checks or user-data errors
+
+---
+
+## Quick reference — where to look on the instance
+
+- App logs / user-data: `/var/log/install.log`
+- Cloud-init output: `/var/log/cloud-init-output.log`
+- App code (cloned): `/home/ec2-user/vp-portfolio-app`
+
+---
+
+If you'd like, tell me the values for the questions above and I will update this README and/or generate IaC (Terraform / CloudFormation) for you.
