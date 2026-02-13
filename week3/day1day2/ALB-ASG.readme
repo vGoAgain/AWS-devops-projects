@@ -282,22 +282,6 @@ This README documents the live deployment as of 2026-02-13 and reflects the conf
 
 ---
 
-If you want any of the optional items applied (HTTPS, IaC, health-check tuning), tell me which one and I'll produce the next artifacts.
-
----
-
-
-
----
-
-## Next steps I can do for you 🔭
-
-- Add/confirm health-check path and tune ASG scaling policies
-- Create Terraform/CFN to codify ALB + ASG + Route53
-- Add HTTPS listener + ACM certificate and update Route53
-- Troubleshoot any failing health checks or user-data errors
-
----
 
 ## Quick reference — where to look on the instance
 
